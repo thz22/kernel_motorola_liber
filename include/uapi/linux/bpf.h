@@ -222,9 +222,6 @@ enum bpf_attach_type {
 /* Specify numa node during map creation */
 #define BPF_F_NUMA_NODE		(1U << 2)
 
-/* flags for BPF_PROG_QUERY */
-#define BPF_F_QUERY_EFFECTIVE	(1U << 0)
-
 #define BPF_OBJ_NAME_LEN 16U
 
 /* Flags for accessing BPF object */
@@ -270,13 +267,7 @@ union bpf_attr {
 		__aligned_u64	log_buf;	/* user supplied buffer */
 		__u32		kern_version;	/* checked when prog_type=kprobe */
 		__u32		prog_flags;
-		char		prog_name[BPF_OBJ_NAME_LEN];
-		__u32		prog_ifindex;	/* ifindex of netdev to prep for */
-		/* For some prog types expected attach type must be known at
-		 * load time to verify attach type specific parts of prog
-		 * (context accesses, allowed helpers, etc).
-		 */
-		__u32		expected_attach_type;
+		__u8		prog_name[BPF_OBJ_NAME_LEN];
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */
@@ -1008,7 +999,7 @@ struct bpf_prog_info {
 	__u32 created_by_uid;
 	__u32 nr_map_ids;
 	__aligned_u64 map_ids;
-	char name[BPF_OBJ_NAME_LEN];
+	__u8  name[BPF_OBJ_NAME_LEN];
 } __attribute__((aligned(8)));
 
 struct bpf_map_info {
