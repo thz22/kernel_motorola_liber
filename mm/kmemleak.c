@@ -564,11 +564,10 @@ static struct kmemleak_object *create_object(unsigned long ptr, size_t size,
 	struct kmemleak_object *object, *parent;
 	struct rb_node **link, *rb_parent;
 
-	object = kmem_cache_alloc(object_cache, gfp_kmemleak_mask(gfp));
-	if (!object) {
-		pr_warn("Cannot allocate a kmemleak_object structure\n");
-		kmemleak_disable();
-		return NULL;
+	while (1) {
+		object = kmem_cache_alloc(object_cache, gfp_kmemleak_mask(gfp));
+		if (object)
+			break;
 	}
 
 	INIT_LIST_HEAD(&object->object_list);
@@ -1523,13 +1522,13 @@ static void kmemleak_scan(void)
 		unsigned long pfn;
 
 		for (pfn = start_pfn; pfn < end_pfn; pfn++) {
-			struct page *page;
+			struct page *page = pfn_to_online_page(pfn);
 
-			if (!pfn_valid(pfn))
+			if (!page)
 				continue;
-			page = pfn_to_page(pfn);
-			/* only scan if page is in use */
-			if (page_count(page) == 0)
+			
+			/* only scan pages belonging to this node */
+			if (page_to_nid(page) != i)
 				continue;
 			scan_block(page, page + 1, NULL);
 			if (!(pfn % (MAX_SCAN_SIZE / sizeof(*page))))
