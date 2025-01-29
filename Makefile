@@ -368,9 +368,9 @@ else
 HOSTCC	= gcc
 HOSTCXX	= g++
 endif
-HOSTCFLAGS   := -Wall -Wmissing-prototypes -Wstrict-prototypes -O2 \
+HOSTCFLAGS   := -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 \
 		-fomit-frame-pointer -std=gnu89 $(HOST_LFS_CFLAGS)
-HOSTCXXFLAGS := -O2 $(HOST_LFS_CFLAGS)
+HOSTCXXFLAGS := -O3 $(HOST_LFS_CFLAGS)
 HOSTLDFLAGS  := $(HOST_LFS_LDFLAGS)
 HOST_LOADLIBES := $(HOST_LFS_LIBS)
 
@@ -727,52 +727,29 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning, unused-but-set-variable)
 KBUILD_CFLAGS	+= $(call cc-disable-warning, unused-function)
 KBUILD_CFLAGS	+= $(call cc-disable-warning, unused-variable)
 
+KBUILD_CFLAGS += -pipe
+
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS   += -Os
 else
 KBUILD_CFLAGS   += -O3
-ifeq ($(cc-name),gcc)
-KBUILD_CFLAGS	+= -mcpu=cortex-a76.cortex-a55+crypto+crc
 endif
+
 ifeq ($(cc-name),clang)
-KBUILD_CFLAGS	+= -mcpu=cortex-a76+crypto+crc
-ifdef CONFIG_LTO_CLANG
-KBUILD_CFLAG	+= -fwhole-program-vtables
+KBUILD_CFLAGS += -march=armv8.2-a+crypto+crc+lse+dotprod \
+	-mcpu=cortex-a55+crypto+crc+lse+dotprod \
+	-mllvm -inline-threshold=1000 \
+	-mllvm -inlinehint-threshold=1000 \
+	-mllvm -polly \
+	-mllvm -polly-postopts \
+	-mllvm -polly-ast-use-context \
+	-mllvm -polly-ast-detect-parallel \
+	-mllvm -polly-run-inliner \
+	-mllvm -polly-reschedule \
+	-mllvm -polly-loopfusion-greedy \
+	-mllvm -polly-vectorizer=stripmine
 endif
-ifdef CONFIG_GCC_GRAPHITE
-GRAPHITE_FLAGS	+= -floop-block \
-			 -ftree-vectorize \
-			 -floop-strip-mine \
-			 -floop-interchange \
-			 -fgraphite-identity \
-			 -floop-nest-optimize \
-			 -ftree-loop-distribution
-OPT_FLAGS	+= $(GRAPHITE_FLAGS)
-KBUILD_LDFLAGS	+= $(GRAPHITE_FLAGS)
-endif
-ifdef CONFIG_LLVM_POLLY
-KBUILD_CFLAGS	+= -mllvm -polly \
-		   -mllvm -polly-run-inliner \
-		   -mllvm -polly-reschedule=1 \
-		   -mllvm -polly-loopfusion-greedy=1 \
-		   -mllvm -polly-postopts=1 \
-		   -mllvm -polly-num-threads=0 \
-	           -mllvm -polly-omp-backend=LLVM \
-		   -mllvm -polly-scheduling=dynamic \
-		   -mllvm -polly-scheduling-chunksize=1 \
-		   -mllvm -polly-isl-arg=--no-schedule-serialize-sccs \
-		   -mllvm -polly-ast-use-context \
-		   -mllvm -polly-position=before-vectorizer \
-		   -mllvm -polly-vectorizer=stripmine \
-		   -mllvm -polly-detect-profitability-min-per-loop-insts=40 \
-		   -mllvm -polly-invariant-load-hoisting
-		   
-KBUILD_CFLAGS += $(POLLY_FLAGS)
-KBUILD_AFLAGS += $(POLLY_FLAGS)
-KBUILD_LDFLAGS += $(POLLY_FLAGS)
-endif
-endif
-endif
+
 ifdef CONFIG_MINIMAL_TRACING_FOR_IORAP
 KBUILD_CFLAGS   += -DNOTRACE
 endif
@@ -853,7 +830,11 @@ KBUILD_CFLAGS += $(call cc-disable-warning, unused-but-set-variable)
 endif
 
 ifeq ($(ld-name),lld)
-LDFLAGS += -O2
+ifdef CONFIG_LTO_CLANG
+LDFLAGS += --lto-O3
+else
+LDFLAGS += -O3
+endif
 endif
 
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
@@ -933,9 +914,6 @@ else
 lto-clang-flags	:= -flto
 endif
 lto-clang-flags += -fvisibility=default $(call cc-option, -fsplit-lto-unit)
-
-# Limit inlining across translation units to reduce binary size
-LD_FLAGS_LTO_CLANG := -mllvm -import-instr-limit=5
 
 KBUILD_LDFLAGS += $(LD_FLAGS_LTO_CLANG)
 KBUILD_LDFLAGS_MODULE += $(LD_FLAGS_LTO_CLANG)
