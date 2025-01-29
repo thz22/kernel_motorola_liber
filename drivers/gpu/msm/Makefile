@@ -2,7 +2,6 @@ ccflags-y := -Iinclude/linux
 ccflags-y := -funroll-loops
 ccflags-y := -ffast-math
 ccflags-y := -Ofast
-ccflags-y := -Wno-deprecated-ofast
 
 msm_kgsl_core-y = \
 	kgsl.o \
