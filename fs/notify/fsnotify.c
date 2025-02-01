@@ -1,395 +1,218 @@
-/*
- *  Copyright (C) 2008 Red Hat, Inc., Eric Paris <eparis@redhat.com>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/dcache.h>
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/file.h>
 #include <linux/fs.h>
-#include <linux/gfp.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/mount.h>
-#include <linux/srcu.h>
-
 #include <linux/fsnotify_backend.h>
-#include "fsnotify.h"
+#include <linux/idr.h>
+#include <linux/init.h>
+#include <linux/inotify.h>
+#include <linux/fanotify.h>
+#include <linux/kernel.h>
+#include <linux/namei.h>
+#include <linux/sched.h>
+#include <linux/types.h>
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
+#include <linux/exportfs.h>
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/susfs_def.h>
+#endif
 
-/*
- * Clear all of the marks on an inode when it is being evicted from core
- */
-void __fsnotify_inode_delete(struct inode *inode)
+#include "inotify/inotify.h"
+#include "../fs/mount.h"
+
+#if defined(CONFIG_PROC_FS)
+
+#if defined(CONFIG_INOTIFY_USER) || defined(CONFIG_FANOTIFY)
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+static void show_fdinfo(struct seq_file *m, struct file *f,
+			void (*show)(struct seq_file *m,
+				     struct fsnotify_mark *mark,
+					 struct file *file))
+#else
+static void show_fdinfo(struct seq_file *m, struct file *f,
+			void (*show)(struct seq_file *m,
+				     struct fsnotify_mark *mark))
+#endif
 {
-	fsnotify_clear_marks_by_inode(inode);
-}
-EXPORT_SYMBOL_GPL(__fsnotify_inode_delete);
+	struct fsnotify_group *group = f->private_data;
+	struct fsnotify_mark *mark;
 
-void __fsnotify_vfsmount_delete(struct vfsmount *mnt)
-{
-	fsnotify_clear_marks_by_mount(mnt);
-}
-
-/**
- * fsnotify_unmount_inodes - an sb is unmounting.  handle any watched inodes.
- * @sb: superblock being unmounted.
- *
- * Called during unmount with no locks held, so needs to be safe against
- * concurrent modifiers. We temporarily drop sb->s_inode_list_lock and CAN block.
- */
-void fsnotify_unmount_inodes(struct super_block *sb)
-{
-	struct inode *inode, *iput_inode = NULL;
-
-	spin_lock(&sb->s_inode_list_lock);
-	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
-		/*
-		 * We cannot __iget() an inode in state I_FREEING,
-		 * I_WILL_FREE, or I_NEW which is fine because by that point
-		 * the inode cannot have any associated watches.
-		 */
-		spin_lock(&inode->i_lock);
-		if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW)) {
-			spin_unlock(&inode->i_lock);
-			continue;
-		}
-
-		/*
-		 * If i_count is zero, the inode cannot have any watches and
-		 * doing an __iget/iput with MS_ACTIVE clear would actually
-		 * evict all inodes with zero i_count from icache which is
-		 * unnecessarily violent and may in fact be illegal to do.
-		 */
-		if (!atomic_read(&inode->i_count)) {
-			spin_unlock(&inode->i_lock);
-			continue;
-		}
-
-		__iget(inode);
-		spin_unlock(&inode->i_lock);
-		spin_unlock(&sb->s_inode_list_lock);
-
-		if (iput_inode)
-			iput(iput_inode);
-
-		/* for each watch, send FS_UNMOUNT and then remove it */
-		fsnotify(inode, FS_UNMOUNT, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
-
-		fsnotify_inode_delete(inode);
-
-		iput_inode = inode;
-
-		cond_resched();
-		spin_lock(&sb->s_inode_list_lock);
+	mutex_lock(&group->mark_mutex);
+	list_for_each_entry(mark, &group->marks_list, g_list) {
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		show(m, mark, f);
+#else
+		show(m, mark);
+#endif
+		if (seq_has_overflowed(m))
+			break;
 	}
-	spin_unlock(&sb->s_inode_list_lock);
-
-	if (iput_inode)
-		iput(iput_inode);
+	mutex_unlock(&group->mark_mutex);
 }
 
-/*
- * Given an inode, first check if we care what happens to our children.  Inotify
- * and dnotify both tell their parents about events.  If we care about any event
- * on a child we run all of our children and set a dentry flag saying that the
- * parent cares.  Thus when an event happens on a child it can quickly tell if
- * if there is a need to find a parent and send the event to the parent.
- */
-void __fsnotify_update_child_dentry_flags(struct inode *inode)
+#if defined(CONFIG_EXPORTFS)
+static void show_mark_fhandle(struct seq_file *m, struct inode *inode)
 {
-	struct dentry *alias;
-	int watched;
+	struct {
+		struct file_handle handle;
+		u8 pad[MAX_HANDLE_SZ];
+	} f;
+	int size, ret, i;
 
-	if (!S_ISDIR(inode->i_mode))
+	f.handle.handle_bytes = sizeof(f.pad);
+	size = f.handle.handle_bytes >> 2;
+
+	ret = exportfs_encode_inode_fh(inode, (struct fid *)f.handle.f_handle, &size, 0);
+	if ((ret == FILEID_INVALID) || (ret < 0)) {
+		WARN_ONCE(1, "Can't encode file handler for inotify: %d\n", ret);
+		return;
+	}
+
+	f.handle.handle_type = ret;
+	f.handle.handle_bytes = size * sizeof(u32);
+
+	seq_printf(m, "fhandle-bytes:%x fhandle-type:%x f_handle:",
+		   f.handle.handle_bytes, f.handle.handle_type);
+
+	for (i = 0; i < f.handle.handle_bytes; i++)
+		seq_printf(m, "%02x", (int)f.handle.f_handle[i]);
+}
+#else
+static void show_mark_fhandle(struct seq_file *m, struct inode *inode)
+{
+}
+#endif
+
+#ifdef CONFIG_INOTIFY_USER
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)
+#else
+static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+#endif
+{
+	struct inotify_inode_mark *inode_mark;
+	struct inode *inode;
+
+	if (!(mark->connector->flags & FSNOTIFY_OBJ_TYPE_INODE))
 		return;
 
-	/* determine if the children should tell inode about their events */
-	watched = fsnotify_inode_watches_children(inode);
-
-	spin_lock(&inode->i_lock);
-	/* run all of the dentries associated with this inode.  Since this is a
-	 * directory, there damn well better only be one item on this list */
-	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
-		struct dentry *child;
-
-		/* run all of the children of the original inode and fix their
-		 * d_flags to indicate parental interest (their parent is the
-		 * original inode) */
-		spin_lock(&alias->d_lock);
-		list_for_each_entry(child, &alias->d_subdirs, d_child) {
-			if (!child->d_inode)
-				continue;
-
-			spin_lock_nested(&child->d_lock, DENTRY_D_LOCK_NESTED);
-			if (watched)
-				child->d_flags |= DCACHE_FSNOTIFY_PARENT_WATCHED;
-			else
-				child->d_flags &= ~DCACHE_FSNOTIFY_PARENT_WATCHED;
-			spin_unlock(&child->d_lock);
-		}
-		spin_unlock(&alias->d_lock);
-	}
-	spin_unlock(&inode->i_lock);
-}
-
-/* Notify this dentry's parent about a child's events. */
-int __fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask)
-{
-	struct dentry *parent;
-	struct inode *p_inode;
-	int ret = 0;
-
-	if (!dentry)
-		dentry = path->dentry;
-
-	if (!(dentry->d_flags & DCACHE_FSNOTIFY_PARENT_WATCHED))
-		return 0;
-
-	parent = dget_parent(dentry);
-	p_inode = parent->d_inode;
-
-	if (unlikely(!fsnotify_inode_watches_children(p_inode))) {
-		__fsnotify_update_child_dentry_flags(p_inode);
-	} else if (p_inode->i_fsnotify_mask & mask & ~FS_EVENT_ON_CHILD) {
-		struct name_snapshot name;
-
-		/* we are notifying a parent so come up with the new mask which
-		 * specifies these are events which came from a child. */
-		mask |= FS_EVENT_ON_CHILD;
-
-		take_dentry_name_snapshot(&name, dentry);
-		if (path)
-			ret = fsnotify(p_inode, mask, path, FSNOTIFY_EVENT_PATH,
-				       name.name, 0);
-		else
-			ret = fsnotify(p_inode, mask, dentry->d_inode, FSNOTIFY_EVENT_INODE,
-				       name.name, 0);
-		release_dentry_name_snapshot(&name);
-	}
-
-	dput(parent);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(__fsnotify_parent);
-
-static int send_to_group(struct inode *to_tell,
-			 struct fsnotify_mark *inode_mark,
-			 struct fsnotify_mark *vfsmount_mark,
-			 __u32 mask, const void *data,
-			 int data_is, u32 cookie,
-			 const unsigned char *file_name,
-			 struct fsnotify_iter_info *iter_info)
-{
-	struct fsnotify_group *group = NULL;
-	__u32 test_mask = (mask & ~FS_EVENT_ON_CHILD);
-	__u32 marks_mask = 0;
-	__u32 marks_ignored_mask = 0;
-
-	if (unlikely(!inode_mark && !vfsmount_mark)) {
-		BUG();
-		return 0;
-	}
-
-	/* clear ignored on inode modification */
-	if (mask & FS_MODIFY) {
-		if (inode_mark &&
-		    !(inode_mark->flags & FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY))
-			inode_mark->ignored_mask = 0;
-		if (vfsmount_mark &&
-		    !(vfsmount_mark->flags & FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY))
-			vfsmount_mark->ignored_mask = 0;
-	}
-
-	/* does the inode mark tell us to do something? */
-	if (inode_mark) {
-		group = inode_mark->group;
-		marks_mask |= inode_mark->mask;
-		marks_ignored_mask |= inode_mark->ignored_mask;
-	}
-
-	/* does the vfsmount_mark tell us to do something? */
-	if (vfsmount_mark) {
-		group = vfsmount_mark->group;
-		marks_mask |= vfsmount_mark->mask;
-		marks_ignored_mask |= vfsmount_mark->ignored_mask;
-	}
-
-	pr_debug("%s: group=%p to_tell=%p mask=%x inode_mark=%p"
-		 " vfsmount_mark=%p marks_mask=%x marks_ignored_mask=%x"
-		 " data=%p data_is=%d cookie=%d\n",
-		 __func__, group, to_tell, mask, inode_mark, vfsmount_mark,
-		 marks_mask, marks_ignored_mask, data,
-		 data_is, cookie);
-
-	if (!(test_mask & marks_mask & ~marks_ignored_mask))
-		return 0;
-
-	return group->ops->handle_event(group, to_tell, inode_mark,
-					vfsmount_mark, mask, data, data_is,
-					file_name, cookie, iter_info);
-}
-
-/*
- * This is the main call to fsnotify.  The VFS calls into hook specific functions
- * in linux/fsnotify.h.  Those functions then in turn call here.  Here will call
- * out to all of the registered fsnotify_group.  Those groups can then use the
- * notification event in whatever means they feel necessary.
- */
-int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
-	     const unsigned char *file_name, u32 cookie)
-{
-	struct hlist_node *inode_node = NULL, *vfsmount_node = NULL;
-	struct fsnotify_mark *inode_mark = NULL, *vfsmount_mark = NULL;
-	struct fsnotify_group *inode_group, *vfsmount_group;
-	struct fsnotify_mark_connector *inode_conn, *vfsmount_conn;
-	struct fsnotify_iter_info iter_info;
-	struct mount *mnt;
-	int ret = 0;
-	/* global tests shouldn't care about events on child only the specific event */
-	__u32 test_mask = (mask & ~FS_EVENT_ON_CHILD);
-
-	if (data_is == FSNOTIFY_EVENT_PATH)
-		mnt = real_mount(((const struct path *)data)->mnt);
-	else
-		mnt = NULL;
-
-	/* An event "on child" is not intended for a mount mark */
-	if (mask & FS_EVENT_ON_CHILD)
-		mnt = NULL;
-
-	/*
-	 * Optimization: srcu_read_lock() has a memory barrier which can
-	 * be expensive.  It protects walking the *_fsnotify_marks lists.
-	 * However, if we do not walk the lists, we do not have to do
-	 * SRCU because we have no references to any objects and do not
-	 * need SRCU to keep them "alive".
-	 */
-	if (!to_tell->i_fsnotify_marks &&
-	    (!mnt || !mnt->mnt_fsnotify_marks))
-		return 0;
-	/*
-	 * if this is a modify event we may need to clear the ignored masks
-	 * otherwise return if neither the inode nor the vfsmount care about
-	 * this type of event.
-	 */
-	if (!(mask & FS_MODIFY) &&
-	    !(test_mask & to_tell->i_fsnotify_mask) &&
-	    !(mnt && test_mask & mnt->mnt_fsnotify_mask))
-		return 0;
-
-	iter_info.srcu_idx = srcu_read_lock(&fsnotify_mark_srcu);
-
-	inode_conn = srcu_dereference(to_tell->i_fsnotify_marks,
-				      &fsnotify_mark_srcu);
-	if (inode_conn)
-		inode_node = srcu_dereference(inode_conn->list.first,
-					      &fsnotify_mark_srcu);
-
-	if (mnt) {
-		inode_conn = srcu_dereference(to_tell->i_fsnotify_marks,
-					      &fsnotify_mark_srcu);
-		if (inode_conn)
-			inode_node = srcu_dereference(inode_conn->list.first,
-						      &fsnotify_mark_srcu);
-		vfsmount_conn = srcu_dereference(mnt->mnt_fsnotify_marks,
-					         &fsnotify_mark_srcu);
-		if (vfsmount_conn)
-			vfsmount_node = srcu_dereference(
-						vfsmount_conn->list.first,
-						&fsnotify_mark_srcu);
-	}
-
-	/*
-	 * We need to merge inode & vfsmount mark lists so that inode mark
-	 * ignore masks are properly reflected for mount mark notifications.
-	 * That's why this traversal is so complicated...
-	 */
-	while (inode_node || vfsmount_node) {
-		inode_group = NULL;
-		inode_mark = NULL;
-		vfsmount_group = NULL;
-		vfsmount_mark = NULL;
-
-		if (inode_node) {
-			inode_mark = hlist_entry(srcu_dereference(inode_node, &fsnotify_mark_srcu),
-						 struct fsnotify_mark, obj_list);
-			inode_group = inode_mark->group;
-		}
-
-		if (vfsmount_node) {
-			vfsmount_mark = hlist_entry(srcu_dereference(vfsmount_node, &fsnotify_mark_srcu),
-						    struct fsnotify_mark, obj_list);
-			vfsmount_group = vfsmount_mark->group;
-		}
+	inode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
+	inode = igrab(mark->connector->inode);
+	if (inode) {
 		/*
-		 * Need to protect both marks against freeing so that we can
-		 * continue iteration from this place, regardless of which mark
-		 * we actually happen to send an event for.
+		 * IN_ALL_EVENTS represents all of the mask bits
+		 * that we expose to userspace.  There is at
+		 * least one bit (FS_EVENT_ON_CHILD) which is
+		 * used only internally to the kernel.
 		 */
-		iter_info.inode_mark = inode_mark;
-		iter_info.vfsmount_mark = vfsmount_mark;
-
-		if (inode_group && vfsmount_group) {
-			int cmp = fsnotify_compare_groups(inode_group,
-							  vfsmount_group);
-			if (cmp > 0) {
-				inode_group = NULL;
-				inode_mark = NULL;
-			} else if (cmp < 0) {
-				vfsmount_group = NULL;
-				vfsmount_mark = NULL;
+		u32 mask = mark->mask & IN_ALL_EVENTS;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		if (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+				unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
+			struct path path;
+			char *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+			char *dpath;
+			if (!pathname) {
+				goto out_seq_printf;
 			}
+			dpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+			if (!dpath) {
+				goto out_free_pathname;
+			}
+			if (kern_path(dpath, 0, &path)) {
+				goto out_free_pathname;
+			}
+			seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
+			   inode_mark->wd, path.dentry->d_inode->i_ino, path.dentry->d_inode->i_sb->s_dev,
+			   mask, mark->ignored_mask);
+			show_mark_fhandle(m, path.dentry->d_inode);
+			seq_putc(m, '\n');
+			iput(inode);
+			path_put(&path);
+			kfree(pathname);
+			return;
+out_free_pathname:
+			kfree(pathname);
 		}
-
-		ret = send_to_group(to_tell, inode_mark, vfsmount_mark, mask,
-				    data, data_is, cookie, file_name,
-				    &iter_info);
-
-		if (ret && (mask & ALL_FSNOTIFY_PERM_EVENTS))
-			goto out;
-
-		if (inode_group)
-			inode_node = srcu_dereference(inode_node->next,
-						      &fsnotify_mark_srcu);
-		if (vfsmount_group)
-			vfsmount_node = srcu_dereference(vfsmount_node->next,
-							 &fsnotify_mark_srcu);
+out_seq_printf:
+#endif
+		seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
+			   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
+			   mask, mark->ignored_mask);
+		show_mark_fhandle(m, inode);
+		seq_putc(m, '\n');
+		iput(inode);
 	}
-	ret = 0;
-out:
-	srcu_read_unlock(&fsnotify_mark_srcu, iter_info.srcu_idx);
-
-	return ret;
 }
-EXPORT_SYMBOL_GPL(fsnotify);
 
-extern struct kmem_cache *fsnotify_mark_connector_cachep;
-
-static __init int fsnotify_init(void)
+void inotify_show_fdinfo(struct seq_file *m, struct file *f)
 {
-	int ret;
-
-	BUG_ON(hweight32(ALL_FSNOTIFY_EVENTS) != 23);
-
-	ret = init_srcu_struct(&fsnotify_mark_srcu);
-	if (ret)
-		panic("initializing fsnotify_mark_srcu");
-
-	fsnotify_mark_connector_cachep = KMEM_CACHE(fsnotify_mark_connector,
-						    SLAB_PANIC);
-
-	return 0;
+	show_fdinfo(m, f, inotify_fdinfo);
 }
-core_initcall(fsnotify_init);
+
+#endif /* CONFIG_INOTIFY_USER */
+
+#ifdef CONFIG_FANOTIFY
+
+static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+{
+	unsigned int mflags = 0;
+	struct inode *inode;
+
+	if (mark->flags & FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY)
+		mflags |= FAN_MARK_IGNORED_SURV_MODIFY;
+
+	if (mark->connector->flags & FSNOTIFY_OBJ_TYPE_INODE) {
+		inode = igrab(mark->connector->inode);
+		if (!inode)
+			return;
+		seq_printf(m, "fanotify ino:%lx sdev:%x mflags:%x mask:%x ignored_mask:%x ",
+			   inode->i_ino, inode->i_sb->s_dev,
+			   mflags, mark->mask, mark->ignored_mask);
+		show_mark_fhandle(m, inode);
+		seq_putc(m, '\n');
+		iput(inode);
+	} else if (mark->connector->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
+		struct mount *mnt = real_mount(mark->connector->mnt);
+
+		seq_printf(m, "fanotify mnt_id:%x mflags:%x mask:%x ignored_mask:%x\n",
+			   mnt->mnt_id, mflags, mark->mask, mark->ignored_mask);
+	}
+}
+
+void fanotify_show_fdinfo(struct seq_file *m, struct file *f)
+{
+	struct fsnotify_group *group = f->private_data;
+	unsigned int flags = 0;
+
+	switch (group->priority) {
+	case FS_PRIO_0:
+		flags |= FAN_CLASS_NOTIF;
+		break;
+	case FS_PRIO_1:
+		flags |= FAN_CLASS_CONTENT;
+		break;
+	case FS_PRIO_2:
+		flags |= FAN_CLASS_PRE_CONTENT;
+		break;
+	}
+
+	if (group->max_events == UINT_MAX)
+		flags |= FAN_UNLIMITED_QUEUE;
+
+	if (group->fanotify_data.max_marks == UINT_MAX)
+		flags |= FAN_UNLIMITED_MARKS;
+
+	seq_printf(m, "fanotify flags:%x event-flags:%x\n",
+		   flags, group->fanotify_data.f_flags);
+
+	show_fdinfo(m, f, fanotify_fdinfo);
+}
+
+#endif /* CONFIG_FANOTIFY */
+
+#endif /* CONFIG_INOTIFY_USER || CONFIG_FANOTIFY */
+
+#endif /* CONFIG_PROC_FS */
