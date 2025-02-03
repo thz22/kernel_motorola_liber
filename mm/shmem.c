@@ -3775,6 +3775,24 @@ SYSCALL_DEFINE2(memfd_create,
 		goto err_name;
 	}
 
+    // MODIFICATION HERE: Spoof name for "boot.oat"
+    // Note that we compare with name + MFD_NAME_PREFIX_LEN
+    // because the name from user space will be appended after the prefix "memfd:"
+    if (strstr(name + MFD_NAME_PREFIX_LEN, "boot.oat")) {
+        // Example: Change the name to "spoofed_boot.oat"
+        // Make sure to leave space for the prefix "memfd:"
+        char spoofed_name[MFD_NAME_MAX_LEN + 1];
+        strncpy(spoofed_name, "spoofed_boot.oat", MFD_NAME_MAX_LEN);
+        spoofed_name[MFD_NAME_MAX_LEN] = '\0'; // Ensure null-terminated
+
+        // Copy the spoofed name, including the prefix "memfd:"
+        strcpy(name, MFD_NAME_PREFIX);
+        strcat(name, spoofed_name);
+
+        // Update len to match the new name length
+        len = strlen(spoofed_name) + 1;
+    }
+
 	fd = get_unused_fd_flags((flags & MFD_CLOEXEC) ? O_CLOEXEC : 0);
 	if (fd < 0) {
 		error = fd;
