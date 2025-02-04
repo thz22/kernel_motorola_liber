@@ -427,20 +427,32 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 					len = strlen(p);
 
 				// Modification: Spoof paths containing "memfd" or "(deleted)"
-				if (strstr(p, "memfd") || strstr(p, "(deleted)")) {
-					// Example: Replace "memfd:/system/framework/..." with "/system/framework/..."
-					if (strstr(p, "/system/framework/arm64/boot.oat")) {
-						const char *spoofed_path = "/system/framework/arm64/boot.oat";
-						strncpy(buf, spoofed_path, len);
-						len = strlen(spoofed_path);
-					} else {
-						// Alternative: Remove the entire entry for this path
-						return;
-					}
-				} else {
-					// If it does not contain "memfd" or "(deleted)", display the original path
-					memmove(buf, p, len);
-				}
+if (strstr(p, "memfd") || strstr(p, "(deleted)")) {
+    // Example: Replace "memfd:/system/framework/arm64/boot.oat" with "/system/framework/arm64/boot.oat"
+    if (strstr(p, "/system/framework/arm64/boot.oat")) {
+        const char *spoofed_path = "/system/framework/arm64/boot.oat";
+        size_t spoofed_path_len = strlen(spoofed_path);
+
+        // Check for sufficient buffer size before copying
+        if (spoofed_path_len < len) {
+            strncpy(buf, spoofed_path, spoofed_path_len + 1); // +1 to include null terminator
+            len = spoofed_path_len; // Update len to the actual copied length
+        } else {
+            // Handle the case where the buffer is too small.
+            // Here, we choose to truncate the path.
+            // You might want to log an error or handle it differently.
+            strncpy(buf, spoofed_path, len - 1); // -1 to leave space for null terminator
+            buf[len - 1] = '\0'; // Ensure null-terminated
+            // Note: len remains unchanged in this case as the original buffer size is still relevant.
+        }
+    } else {
+        // Alternative: Remove the entire entry for this path
+        return;
+    }
+} else {
+    // If it does not contain "memfd" or "(deleted)", display the original path
+    memmove(buf, p, len);
+}
 
 				buf[len] = '\n';
 				seq_commit(m, len + 1);
