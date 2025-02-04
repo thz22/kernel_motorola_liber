@@ -3776,22 +3776,33 @@ SYSCALL_DEFINE2(memfd_create,
 	}
 
     // MODIFICATION HERE: Spoof name for "boot.oat"
-    // Note that we compare with name + MFD_NAME_PREFIX_LEN
-    // because the name from user space will be appended after the prefix "memfd:"
-    if (strstr(name + MFD_NAME_PREFIX_LEN, "boot.oat")) {
-        // Example: Change the name to "spoofed_boot.oat"
-        // Make sure to leave space for the prefix "memfd:"
-        char spoofed_name[MFD_NAME_MAX_LEN + 1];
-        strncpy(spoofed_name, "spoofed_boot.oat", MFD_NAME_MAX_LEN);
-        spoofed_name[MFD_NAME_MAX_LEN] = '\0'; // Ensure null-terminated
+// Note that we compare with name + MFD_NAME_PREFIX_LEN
+// because the name from user space will be appended after the prefix "memfd:"
+if (strstr(name + MFD_NAME_PREFIX_LEN, "boot.oat")) {
+    // Example: Change the name to "spoofed_boot.oat"
+    // Make sure to leave space for the prefix "memfd:"
+    char spoofed_name[MFD_NAME_MAX_LEN + 1];
+    const char *new_name = "spoofed_boot.oat";
+    size_t new_name_len = strlen(new_name);
 
-        // Copy the spoofed name, including the prefix "memfd:"
+    // Ensure the new name, including the prefix, fits within MFD_NAME_MAX_LEN
+    if (MFD_NAME_PREFIX_LEN + new_name_len < MFD_NAME_MAX_LEN) {
+        strncpy(spoofed_name, new_name, MFD_NAME_MAX_LEN);
+        spoofed_name[MFD_NAME_MAX_LEN] = '\0'; // Ensure null-terminated (redundant here but good practice)
+
+        // Construct the final name, including the "memfd:" prefix
         strcpy(name, MFD_NAME_PREFIX);
         strcat(name, spoofed_name);
 
-        // Update len to match the new name length
-        len = strlen(spoofed_name) + 1;
+        // Update len to match the new name length (including prefix)
+        len = strlen(name);
+    } else {
+        // Handle the case where the new name is too long.
+        // Here, we skip the modification. You might want to log an error.
+        // Alternative: Truncate the new name to fit.
+        // fprintf(stderr, "Error: New name for memfd is too long.\n");
     }
+}
 
 	fd = get_unused_fd_flags((flags & MFD_CLOEXEC) ? O_CLOEXEC : 0);
 	if (fd < 0) {
